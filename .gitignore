@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Data files (raw 실험 데이터는 제외)
+*.csv
+*.tsv
+*.xlsx
+*.mat
+*.h5
+*.edf
+*.wav
+data/
+raw_data/
+results/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Tensorboard / Wandb logs
+runs/
+wandb/
