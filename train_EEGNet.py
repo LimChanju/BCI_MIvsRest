@@ -20,9 +20,7 @@ for f in files:
     print(f"\n=== Loading {f} ===")
     raw = mne.io.read_raw_gdf(f, preload=True)
     events, event_dict = mne.events_from_annotations(raw)
-
-    # C3, C4, Cz 세 채널 선택
-    raw.pick_channels(["EEG:C3", "EEG:C4", "EEG:Cz"])
+    raw.pick_channels(["EEG:C3"])
     raw.filter(8., 30., fir_design="firwin")
 
     # MI 이벤트 찾기
@@ -46,7 +44,7 @@ for f in files:
     rest_epochs = mne.Epochs(raw, events_fixed, event_id=event_id,
                              tmin=-2.0, tmax=0.0,
                              baseline=None, preload=True)
-    X_rest = rest_epochs.get_data()   # (n_trials, n_channels=3, times)
+    X_rest = rest_epochs.get_data()   # (n_trials, 1, times)
     y_rest = np.zeros(len(X_rest))    # label=0
 
     # === MI epochs (0.5s ~ 2.5s) ===
@@ -63,13 +61,13 @@ for f in files:
 # --------------------------
 # 2. 데이터 합치기
 # --------------------------
-X = np.concatenate(X_all, axis=0)  # (trials, 3, times)
+X = np.concatenate(X_all, axis=0)
 y = np.concatenate(y_all, axis=0)
 print("\nFinal data shape:", X.shape)
 print("Final labels:", np.unique(y, return_counts=True))
 
 # Torch tensor 변환
-X = torch.tensor(X, dtype=torch.float32)  
+X = torch.tensor(X, dtype=torch.float32)  # (trials, 1, times)
 y = torch.tensor(y, dtype=torch.long)
 
 X_train, X_test, y_train, y_test = train_test_split(
@@ -83,40 +81,77 @@ train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
 
 # --------------------------
-# 3. Light-weight 1D-CNN 모델 정의 (다채널 입력용)
+# 3. EEGNet 모델 정의
 # --------------------------
-class Light1DCNN(nn.Module):
-    def __init__(self, n_channels, n_times, n_classes=2):
-        super(Light1DCNN, self).__init__()
-        # in_channels = 3 (C3, C4, Cz)
-        self.conv1 = nn.Conv1d(n_channels, 16, kernel_size=5, stride=1, bias=False)
-        nn.init.kaiming_uniform_(self.conv1.weight, nonlinearity='relu')
+class EEGNet(nn.Module):
+    def __init__(self, n_channels=1, n_times=500, n_classes=2, F1=8, D=2, F2=16, kernel_length=64, dropout=0.25):
+        super(EEGNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_times = n_times
 
-        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, stride=1, bias=False)
-        nn.init.kaiming_uniform_(self.conv2.weight, nonlinearity='relu')
+        # 1. Temporal Convolution
+        self.conv1 = nn.Conv2d(1, F1, (1, kernel_length), padding=(0, kernel_length // 2), bias=False)
+        self.bn1 = nn.BatchNorm2d(F1)
 
-        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
-        self.dropout = nn.Dropout(0.25)
+        # 2. Depthwise Convolution (spatial filter)
+        self.depthwise = nn.Conv2d(F1, F1 * D, (n_channels, 1), groups=F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(F1 * D)
+        self.elu = nn.ELU()
 
-        conv_out = (n_times - 4 - 4) // 2
-        self.fc = nn.Linear(32 * conv_out, n_classes, bias=False)
-        nn.init.xavier_uniform_(self.fc.weight)
+        # Pooling + Dropout
+        self.pool1 = nn.AvgPool2d((1, 4))
+        self.drop1 = nn.Dropout(dropout)
+
+        # 3. Separable Convolution
+        self.separable_conv = nn.Sequential(
+            nn.Conv2d(F1 * D, F1 * D, (1, 16), padding=(0, 8), groups=F1 * D, bias=False),
+            nn.Conv2d(F1 * D, F2, (1, 1), bias=False),
+            nn.BatchNorm2d(F2),
+            nn.ELU(),
+            nn.AvgPool2d((1, 8)),
+            nn.Dropout(dropout)
+        )
+
+        # 최종 FC
+        out_size = self._get_out_size()
+        self.classifier = nn.Linear(out_size, n_classes)
+
+    def _get_out_size(self):
+        with torch.no_grad():
+            x = torch.zeros(1, 1, self.n_channels, self.n_times)
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.depthwise(x)
+            x = self.bn2(x)
+            x = self.elu(x)
+            x = self.pool1(x)
+            x = self.drop1(x)
+            x = self.separable_conv(x)
+            return x.view(1, -1).shape[1]
 
     def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = self.pool(x)
+        # x: (batch, 1, times) → (batch, 1, channels, times)
+        x = x.unsqueeze(2)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.depthwise(x)
+        x = self.bn2(x)
+        x = self.elu(x)
+        x = self.pool1(x)
+        x = self.drop1(x)
+        x = self.separable_conv(x)
         x = x.view(x.size(0), -1)
-        x = self.dropout(x)
-        return self.fc(x)
+        return self.classifier(x)
 
-# 모델 생성
-model = Light1DCNN(n_channels=X.shape[1], n_times=X.shape[2], n_classes=2)
+# --------------------------
+# 4. 모델 초기화
+# --------------------------
+model = EEGNet(n_channels=1, n_times=X.shape[2], n_classes=2)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # --------------------------
-# 5. 학습 루프 (로그 저장)
+# 5. 학습 루프
 # --------------------------
 train_losses, train_accs, test_accs = [], [], []
 
@@ -174,5 +209,5 @@ plt.title("Accuracy (Train vs Test)")
 plt.legend()
 
 plt.tight_layout()
-plt.savefig("./CNN_result/Light1DCNN_C3C4Cz.png", dpi=300)
+plt.savefig("./CNN_result/EEGNet_C3.png", dpi=300)
 plt.show()
