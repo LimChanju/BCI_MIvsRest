@@ -1,13 +1,26 @@
 import mne
 import numpy as np
-import glob
+import glob, os, re, random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
-import os, re
 from sklearn.model_selection import StratifiedKFold
+
+# --------------------------
+# 0. 시드 고정 (완전 재현용)
+# --------------------------
+SEED = 42
+def set_seed(seed=SEED):
+    import torch.backends.cudnn as cudnn
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+set_seed(SEED)
 
 # --------------------------
 # 1. dataset 불러오기 (Training 세션만, 단채널 C3)
@@ -18,23 +31,21 @@ print("Using files:", files)
 X_all, y_all, subj_ids = [], [], []
 
 for f in files:
-    subj_id = int(re.findall(r"B0(\d)", f)[0])  # subject ID 추출
+    subj_id = int(re.findall(r"B0(\d)", f)[0])
     print(f"\n=== Loading {f} (Subject {subj_id}) ===")
 
-    raw = mne.io.read_raw_gdf(f, preload=True)
-    events, event_dict = mne.events_from_annotations(raw)
+    raw = mne.io.read_raw_gdf(f, preload=True, verbose=False)
+    events, event_dict = mne.events_from_annotations(raw, verbose=False)
 
-    # --- 단일채널 C3 + Band-pass 8–30 Hz (FIR)
+    # --- ✅ 단일채널 C3 + Band-pass 8–30 Hz (FIR)
     raw.pick_channels(["EEG:C3"])
-    raw.filter(8., 30., fir_design="firwin")
+    raw.filter(8., 30., fir_design="firwin", verbose=False)
 
     # --- MI 이벤트 탐색
     if "769" in event_dict:
-        left = event_dict["769"]
-        right = event_dict["770"]
+        left, right = event_dict["769"], event_dict["770"]
     elif 769 in event_dict:
-        left = event_dict[769]
-        right = event_dict[770]
+        left, right = event_dict[769], event_dict[770]
     else:
         print(f"⚠️ {f}에서 MI 이벤트 없음 → 건너뜀")
         continue
@@ -48,14 +59,14 @@ for f in files:
     # === Rest epochs (−4.0 ~ 0.0 s)
     rest_epochs = mne.Epochs(raw, events_fixed, event_id=event_id,
                              tmin=-4.0, tmax=0.0,
-                             baseline=None, preload=True)
+                             baseline=None, preload=True, verbose=False)
     X_rest = rest_epochs.get_data()
     y_rest = np.zeros(len(X_rest))
 
     # === MI epochs (0.0 ~ 4.0 s)
     mi_epochs = mne.Epochs(raw, events_fixed, event_id=event_id,
                            tmin=0.0, tmax=4.0,
-                           baseline=None, preload=True)
+                           baseline=None, preload=True, verbose=False)
     X_mi = mi_epochs.get_data()
     y_mi = np.ones(len(X_mi))
 
@@ -143,7 +154,7 @@ for subj in unique_subjects:
     X_subj = X[subj_mask]
     y_subj = y[subj_mask]
 
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
     fold_accs = []
 
     for fold, (train_idx, test_idx) in enumerate(skf.split(X_subj, y_subj), 1):
@@ -162,7 +173,6 @@ for subj in unique_subjects:
         best_acc = 0
         for epoch in range(50):
             model.train()
-            correct, total = 0, 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()
@@ -170,8 +180,6 @@ for subj in unique_subjects:
                 loss = criterion(out, yb)
                 loss.backward()
                 optimizer.step()
-                correct += (out.argmax(1) == yb).sum().item()
-                total += yb.size(0)
 
             # validation
             model.eval()
@@ -228,7 +236,7 @@ plt.axhline(overall_mean, color='red', linestyle='--', label=f'Mean = {overall_m
 plt.fill_between(range(len(subjects)),
                  overall_mean - overall_std, overall_mean + overall_std,
                  color='red', alpha=0.2, label=f'±1 SD ({overall_std:.3f})')
-plt.title("Subject-wise Mean Accuracy (EEGNet1Ch, 10×10 CV, C3)")
+plt.title("Subject-wise Mean Accuracy (EEGNet1Ch, 10×10 CV, C3 8–30Hz)")
 plt.ylabel("Accuracy")
 plt.ylim(0, 1)
 plt.xticks(rotation=45)

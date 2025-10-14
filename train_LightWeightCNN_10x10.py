@@ -1,12 +1,26 @@
 import mne
 import numpy as np
-import glob, re, os
+import glob, re, os, random
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+
+# --------------------------
+# 0. SEED 고정 (완전 재현용)
+# --------------------------
+SEED = 42
+def set_seed(seed=SEED):
+    import torch.backends.cudnn as cudnn
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+set_seed(SEED)
 
 # --------------------------
 # 1. Dataset 불러오기 (Training 세션만, 단채널 C3)
@@ -23,7 +37,7 @@ for f in files:
     raw = mne.io.read_raw_gdf(f, preload=True)
     events, event_dict = mne.events_from_annotations(raw)
 
-    # --- C3 단일 채널 + FIR 8–30 Hz 필터
+    # --- ✅ C3 단일 채널 + FIR 8–30 Hz 필터
     raw.pick_channels(["EEG:C3"])
     raw.filter(8., 30., fir_design="firwin")
 
@@ -88,7 +102,6 @@ class Light1DCNN(nn.Module):
         nn.init.xavier_uniform_(self.fc.weight)
 
     def forward(self, x):
-        # 입력 형태: (B, 1, T)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = self.pool(x)
@@ -111,7 +124,7 @@ for subj in unique_subjects:
     subj_mask = subj_ids == subj
     X_subj, y_subj = X[subj_mask], y[subj_mask]
 
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
     fold_accs = []
 
     for fold, (train_idx, test_idx) in enumerate(skf.split(X_subj, y_subj), 1):
@@ -130,7 +143,6 @@ for subj in unique_subjects:
         best_acc = 0
         for epoch in range(50):
             model.train()
-            correct, total = 0, 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()
@@ -138,8 +150,6 @@ for subj in unique_subjects:
                 loss = criterion(out, yb)
                 loss.backward()
                 optimizer.step()
-                correct += (out.argmax(1) == yb).sum().item()
-                total += yb.size(0)
 
             # Validation
             model.eval()
@@ -196,7 +206,7 @@ plt.axhline(overall_mean, color='red', linestyle='--', label=f'Mean = {overall_m
 plt.fill_between(range(len(subjects)),
                  overall_mean - overall_std, overall_mean + overall_std,
                  color='red', alpha=0.2, label=f'±1 SD ({overall_std:.3f})')
-plt.title("Subject-wise Mean Accuracy (Light1D-CNN, 10×10 CV, C3)")
+plt.title("Subject-wise Mean Accuracy (Light1D-CNN, 10×10 CV, C3 8–30Hz)")
 plt.ylabel("Accuracy")
 plt.ylim(0, 1)
 plt.xticks(rotation=45)
