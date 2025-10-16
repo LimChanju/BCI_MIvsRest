@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-NeuroMel + EEGNet (32×128 version)
+NeuroMel + EEGNet (32×128 version + Heatmap + Summary Save)
  - Gaussian α/β emphasis
  - 10×10 subject-wise CV
  - Feature collapse 방지 (time=128)
+ - μ/β 밴드 히트맵 저장 + 전체 평균 정확도 기록
 """
 import os, re, glob, warnings
 import numpy as np
@@ -23,6 +24,9 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 mne.set_log_level("WARNING")
 
 DATA_DIR = "./dataset/"
+SAVE_DIR = "./Results_NeuroMel"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
 N_MELS, N_FFT, HOP = 16, 128, 64
 BATCH, EPOCHS, LR, SEED = 16, 50, 1e-3, 42
 set_seed = lambda s=SEED: (np.random.seed(s), torch.manual_seed(s), torch.cuda.manual_seed_all(s))
@@ -68,7 +72,7 @@ def eeg_to_neuromel(eeg_signal, fs, band):
     mel_spec = np.dot(mel_fb, S)
     mel_db = librosa.power_to_db(mel_spec, ref=np.max)
     mel_db = (mel_db - np.mean(mel_db)) / (np.std(mel_db) + 1e-6)
-    img = cv2.resize(mel_db, (128, 32), interpolation=cv2.INTER_CUBIC)  # ← 32×128 입력
+    img = cv2.resize(mel_db, (128, 32), interpolation=cv2.INTER_CUBIC)
     return img.astype(np.float32)
 
 # =========================
@@ -112,13 +116,28 @@ def load_bci2b_dataset(path=DATA_DIR):
 # =========================
 # 5. μ/β NeuroMel Dataset
 # =========================
-def make_neuromel_dataset(X_raw, y_raw, fs):
+def make_neuromel_dataset(X_raw, y_raw, fs, subj_dir=None):
     mu, beta = (8, 12), (13, 30)
     mu_feats = [eeg_to_neuromel(x, fs, mu) for x in X_raw]
     beta_feats = [eeg_to_neuromel(x, fs, beta) for x in X_raw]
     mu_feats, beta_feats = np.stack(mu_feats), np.stack(beta_feats)
     X = np.concatenate([mu_feats[:, np.newaxis], beta_feats[:, np.newaxis]], axis=1)
     print("Final X shape:", X.shape)
+
+    # === 히트맵 시각화 (예시 4개씩) ===
+    if subj_dir is not None:
+        os.makedirs(os.path.join(subj_dir, "heatmaps"), exist_ok=True)
+        fig, axes = plt.subplots(2, 4, figsize=(12, 6))
+        for i in range(4):
+            axes[0, i].imshow(mu_feats[i], aspect="auto", origin="lower", cmap="magma")
+            axes[0, i].set_title(f"μ Band (8–12Hz) #{i}")
+            axes[1, i].imshow(beta_feats[i], aspect="auto", origin="lower", cmap="magma")
+            axes[1, i].set_title(f"β Band (13–30Hz) #{i}")
+            for ax in axes[:, i]: ax.axis("off")
+        plt.tight_layout()
+        plt.savefig(os.path.join(subj_dir, "heatmaps", "mu_beta_heatmaps.png"), dpi=300)
+        plt.close()
+
     return torch.tensor(X, dtype=torch.float32), torch.tensor(y_raw, dtype=torch.long), 64, 128
 
 # =========================
@@ -141,9 +160,9 @@ class EEGNet(nn.Module):
             nn.AvgPool2d((1,8)),
             nn.Dropout(dropout)
         )
-        self._tmp_input = torch.zeros(1, 1, chans, samples)
+        tmp = torch.zeros(1, 1, chans, samples)
         with torch.no_grad():
-            out = self.forward_features(self._tmp_input)
+            out = self.forward_features(tmp)
         self.classifier = nn.Linear(out.shape[1], n_classes)
 
     def forward_features(self, x):
@@ -152,19 +171,15 @@ class EEGNet(nn.Module):
         x = self.pool1(x)
         x = self.drop1(x)
         x = self.separable(x)
-        x = x.flatten(start_dim=1)
-        return x
+        return x.flatten(start_dim=1)
 
     def forward(self, x):
-        x = self.forward_features(x)
-        return self.classifier(x)
+        return self.classifier(self.forward_features(x))
 
 # =========================
 # 7. 학습 루프
 # =========================
 def train_one_epoch(model, loader, opt, crit, dev):
-    
-
     model.train(); tot=0
     for xb,yb in loader:
         xb,yb=xb.to(dev),yb.to(dev)
@@ -190,24 +205,25 @@ def eval_acc(model, loader, dev):
 # =========================
 def main():
     X_raw, y_raw, subj_ids, fs = load_bci2b_dataset(DATA_DIR)
-    X, y, chans, samples = make_neuromel_dataset(X_raw, y_raw, fs)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-
-    save_dir = "./NeuroMel_EEGNet_32x128"
-    os.makedirs(save_dir, exist_ok=True)
 
     subjects = np.unique(subj_ids)
     results_mean, results_std = [], []
 
     for subj in subjects:
         print(f"\n=== Subject {subj}: 10×10 CV ===")
+        subj_dir = os.path.join(SAVE_DIR, f"S{subj}")
+        os.makedirs(subj_dir, exist_ok=True)
+
         msk = subj_ids == subj
-        Xs, ys = X[msk], y[msk]
+        Xs, ys = X_raw[msk], y_raw[msk]
+        X, y, chans, samples = make_neuromel_dataset(Xs, ys, fs, subj_dir)
         skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
         accs = []
-        for f, (tr, te) in enumerate(skf.split(Xs, ys), 1):
-            tr_dl = DataLoader(TensorDataset(Xs[tr], ys[tr]), batch_size=BATCH, shuffle=True)
-            te_dl = DataLoader(TensorDataset(Xs[te], ys[te]), batch_size=BATCH)
+
+        for f, (tr, te) in enumerate(skf.split(X, y), 1):
+            tr_dl = DataLoader(TensorDataset(X[tr], y[tr]), batch_size=BATCH, shuffle=True)
+            te_dl = DataLoader(TensorDataset(X[te], y[te]), batch_size=BATCH)
             model = EEGNet(chans, samples).to(dev)
             crit = nn.CrossEntropyLoss()
             opt = torch.optim.Adam(model.parameters(), lr=LR)
@@ -220,11 +236,17 @@ def main():
                     print(f" Fold {f:2d} | Ep {ep:02d} | Loss {loss:.4f} | Acc {acc:.3f}")
             accs.append(best)
             print(f" Fold {f:2d} | Best {best:.3f}")
+
         m, s = np.mean(accs), np.std(accs)
+        np.savetxt(os.path.join(subj_dir, "subject_summary.txt"), [m, s], fmt="%.4f")
         results_mean.append(m); results_std.append(s)
         print(f" → Subject {subj}: {m:.3f} ± {s:.3f}")
 
+    # 전체 평균 저장
     om, osd = np.mean(results_mean), np.std(results_mean)
+    np.savetxt(os.path.join(SAVE_DIR, "overall_summary.txt"), [om, osd], fmt="%.4f")
+
+    # 전체 바그래프
     plt.figure(figsize=(9,6))
     x = np.arange(len(subjects))
     plt.bar(x, results_mean, yerr=results_std, capsize=5, color='steelblue', edgecolor='black', alpha=0.8)
@@ -233,8 +255,9 @@ def main():
     plt.xticks(x, [f"S{s}" for s in subjects])
     plt.title("Subject-wise Accuracy (NeuroMel+EEGNet, 32×128, 10×10 CV, C3 8–30Hz)")
     plt.ylabel("Accuracy"); plt.ylim(0, 1); plt.legend(); plt.tight_layout()
-    plt.savefig(f"{save_dir}/AllSubjects_Bar.png", dpi=300)
-    plt.show()
+    plt.savefig(f"{SAVE_DIR}/AllSubjects_Bar.png", dpi=300)
+    plt.close()
+    print(f"\n=== 전체 평균 정확도: {om:.3f} ± {osd:.3f} ===")
 
 if __name__ == "__main__":
     main()
