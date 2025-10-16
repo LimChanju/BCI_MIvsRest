@@ -1,0 +1,240 @@
+# -*- coding: utf-8 -*-
+"""
+NeuroMel + EEGNet (32×128 version)
+ - Gaussian α/β emphasis
+ - 10×10 subject-wise CV
+ - Feature collapse 방지 (time=128)
+"""
+import os, re, glob, warnings
+import numpy as np
+import librosa
+import mne
+from scipy.signal import butter, filtfilt
+import cv2
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt
+
+# =========================
+# 0. 설정
+# =========================
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+mne.set_log_level("WARNING")
+
+DATA_DIR = "./dataset/"
+N_MELS, N_FFT, HOP = 16, 128, 64
+BATCH, EPOCHS, LR, SEED = 16, 50, 1e-3, 42
+set_seed = lambda s=SEED: (np.random.seed(s), torch.manual_seed(s), torch.cuda.manual_seed_all(s))
+set_seed()
+
+# =========================
+# 1. Band-pass 필터
+# =========================
+def butter_bandpass_filter(data, low, high, fs, order=4):
+    nyq = fs / 2.0
+    b, a = butter(order, [low/nyq, high/nyq], btype="band")
+    return filtfilt(b, a, data)
+
+# =========================
+# 2. NeuroMel Filterbank (Gaussian α/β)
+# =========================
+def neuro_mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
+    freqs = np.linspace(fmin, fmax, n_mels + 2)
+    alpha_center, beta_center = 10.5, 20.0
+    alpha_boost = np.exp(-((freqs - alpha_center) ** 2) / (2 * 3.5 ** 2))
+    beta_boost  = np.exp(-((freqs - beta_center) ** 2) / (2 * 6.5 ** 2))
+    weight = 0.6 * alpha_boost + 0.4 * beta_boost
+    freqs = fmin + (freqs - fmin) * (1 + 2.0 * weight)
+
+    freq_axis = np.linspace(0, sr / 2, n_fft // 2 + 1)
+    fb = np.zeros((n_mels, len(freq_axis)))
+    for m in range(1, n_mels + 1):
+        center = freqs[m]
+        left, right = freqs[m - 1], freqs[m + 1]
+        sigma = (right - left) / 2.5
+        fb[m - 1] = np.exp(-0.5 * ((freq_axis - center) / sigma) ** 2)
+    fb /= np.max(fb, axis=1, keepdims=True) + 1e-8
+    return fb
+
+# =========================
+# 3. EEG → NeuroMel 변환
+# =========================
+def eeg_to_neuromel(eeg_signal, fs, band):
+    low, high = band
+    filtered = butter_bandpass_filter(eeg_signal, low, high, fs)
+    S = np.abs(librosa.stft(y=filtered, n_fft=N_FFT, hop_length=HOP, window='hann')) ** 2
+    mel_fb = neuro_mel_filterbank(int(fs), N_FFT, N_MELS, low, high)
+    mel_spec = np.dot(mel_fb, S)
+    mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+    mel_db = (mel_db - np.mean(mel_db)) / (np.std(mel_db) + 1e-6)
+    img = cv2.resize(mel_db, (128, 32), interpolation=cv2.INTER_CUBIC)  # ← 32×128 입력
+    return img.astype(np.float32)
+
+# =========================
+# 4. BCI 2b 로드 (C3)
+# =========================
+def load_bci2b_dataset(path=DATA_DIR):
+    files = sorted(glob.glob(os.path.join(path, "*T.gdf")))
+    X_all, y_all, subj_ids, fs_out = [], [], [], None
+    for f in files:
+        subj_match = re.search(r"B0(\d)", os.path.basename(f))
+        if not subj_match: continue
+        subj_id = int(subj_match.group(1))
+        raw = mne.io.read_raw_gdf(f, preload=True)
+        events, event_dict = mne.events_from_annotations(raw)
+        raw.pick_channels(["EEG:C3"])
+        fs = raw.info["sfreq"]; fs_out = fs
+        raw.filter(8., 30., fir_design="firwin")
+
+        left = event_dict.get("769") or event_dict.get(769)
+        right = event_dict.get("770") or event_dict.get(770)
+        mi_ids = [v for v in [left, right] if v is not None]
+        mi, rest = [], []
+        for ev in events:
+            if ev[-1] in mi_ids:
+                s, e = int(ev[0]), int(ev[0] + 4.0 * fs)
+                if e <= len(raw.times): mi.append(raw.get_data(start=s, stop=e).squeeze())
+                s, e = int(ev[0] - 4.0 * fs), int(ev[0])
+                if s >= 0: rest.append(raw.get_data(start=s, stop=e).squeeze())
+        if not mi or not rest: continue
+        mi, rest = np.array(mi), np.array(rest)
+        L = min(mi.shape[1], rest.shape[1])
+        X_subj = np.concatenate([mi[:, :L], rest[:, :L]], 0)
+        y_subj = np.concatenate([np.ones(len(mi)), np.zeros(len(rest))])
+        X_all.append(X_subj); y_all.append(y_subj)
+        subj_ids.extend([subj_id]*len(y_subj))
+    X = np.concatenate(X_all); y = np.concatenate(y_all)
+    subj_ids = np.array(subj_ids)
+    print(f"\n총 샘플: {len(X)} | MI:{int(y.sum())} | Rest:{len(y)-int(y.sum())}")
+    return X, y, subj_ids, fs_out
+
+# =========================
+# 5. μ/β NeuroMel Dataset
+# =========================
+def make_neuromel_dataset(X_raw, y_raw, fs):
+    mu, beta = (8, 12), (13, 30)
+    mu_feats = [eeg_to_neuromel(x, fs, mu) for x in X_raw]
+    beta_feats = [eeg_to_neuromel(x, fs, beta) for x in X_raw]
+    mu_feats, beta_feats = np.stack(mu_feats), np.stack(beta_feats)
+    X = np.concatenate([mu_feats[:, np.newaxis], beta_feats[:, np.newaxis]], axis=1)
+    print("Final X shape:", X.shape)
+    return torch.tensor(X, dtype=torch.float32), torch.tensor(y_raw, dtype=torch.long), 64, 128
+
+# =========================
+# 6. EEGNet backbone
+# =========================
+class EEGNet(nn.Module):
+    def __init__(self, chans, samples, n_classes=2, dropout=0.5, kernLength=64, F1=8, D=2, F2=16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, F1, (1, kernLength), padding=(0, kernLength//2), bias=False)
+        self.bn1 = nn.BatchNorm2d(F1)
+        self.depthwise = nn.Conv2d(F1, F1*D, (chans, 1), groups=F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(F1*D)
+        self.pool1 = nn.AvgPool2d((1,4))
+        self.drop1 = nn.Dropout(dropout)
+        self.separable = nn.Sequential(
+            nn.Conv2d(F1*D, F1*D, (1,16), groups=F1*D, padding=(0,8), bias=False),
+            nn.Conv2d(F1*D, F2, 1, bias=False),
+            nn.BatchNorm2d(F2),
+            nn.ELU(),
+            nn.AvgPool2d((1,8)),
+            nn.Dropout(dropout)
+        )
+        self._tmp_input = torch.zeros(1, 1, chans, samples)
+        with torch.no_grad():
+            out = self.forward_features(self._tmp_input)
+        self.classifier = nn.Linear(out.shape[1], n_classes)
+
+    def forward_features(self, x):
+        x = F.elu(self.bn1(self.conv1(x)))
+        x = F.elu(self.bn2(self.depthwise(x)))
+        x = self.pool1(x)
+        x = self.drop1(x)
+        x = self.separable(x)
+        x = x.flatten(start_dim=1)
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        return self.classifier(x)
+
+# =========================
+# 7. 학습 루프
+# =========================
+def train_one_epoch(model, loader, opt, crit, dev):
+    
+
+    model.train(); tot=0
+    for xb,yb in loader:
+        xb,yb=xb.to(dev),yb.to(dev)
+        xb = xb.reshape(xb.size(0), 1, xb.size(1)*xb.size(2), xb.size(3))
+        opt.zero_grad()
+        out=model(xb)
+        loss=crit(out,yb); loss.backward(); opt.step()
+        tot+=loss.item()
+    return tot/len(loader)
+
+@torch.no_grad()
+def eval_acc(model, loader, dev):
+    model.eval(); c=t=0
+    for xb,yb in loader:
+        xb,yb=xb.to(dev),yb.to(dev)
+        xb = xb.reshape(xb.size(0), 1, xb.size(1)*xb.size(2), xb.size(3))
+        p=model(xb).argmax(1)
+        c+=(p==yb).sum().item(); t+=yb.size(0)
+    return c/t
+
+# =========================
+# 8. 메인 (10×10 CV)
+# =========================
+def main():
+    X_raw, y_raw, subj_ids, fs = load_bci2b_dataset(DATA_DIR)
+    X, y, chans, samples = make_neuromel_dataset(X_raw, y_raw, fs)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    save_dir = "./NeuroMel_EEGNet_32x128"
+    os.makedirs(save_dir, exist_ok=True)
+
+    subjects = np.unique(subj_ids)
+    results_mean, results_std = [], []
+
+    for subj in subjects:
+        print(f"\n=== Subject {subj}: 10×10 CV ===")
+        msk = subj_ids == subj
+        Xs, ys = X[msk], y[msk]
+        skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
+        accs = []
+        for f, (tr, te) in enumerate(skf.split(Xs, ys), 1):
+            tr_dl = DataLoader(TensorDataset(Xs[tr], ys[tr]), batch_size=BATCH, shuffle=True)
+            te_dl = DataLoader(TensorDataset(Xs[te], ys[te]), batch_size=BATCH)
+            model = EEGNet(chans, samples).to(dev)
+            crit = nn.CrossEntropyLoss()
+            opt = torch.optim.Adam(model.parameters(), lr=LR)
+            best = 0
+            for ep in range(EPOCHS):
+                loss = train_one_epoch(model, tr_dl, opt, crit, dev)
+                acc = eval_acc(model, te_dl, dev)
+                best = max(best, acc)
+                if ep % 10 == 0:
+                    print(f" Fold {f:2d} | Ep {ep:02d} | Loss {loss:.4f} | Acc {acc:.3f}")
+            accs.append(best)
+            print(f" Fold {f:2d} | Best {best:.3f}")
+        m, s = np.mean(accs), np.std(accs)
+        results_mean.append(m); results_std.append(s)
+        print(f" → Subject {subj}: {m:.3f} ± {s:.3f}")
+
+    om, osd = np.mean(results_mean), np.std(results_mean)
+    plt.figure(figsize=(9,6))
+    x = np.arange(len(subjects))
+    plt.bar(x, results_mean, yerr=results_std, capsize=5, color='steelblue', edgecolor='black', alpha=0.8)
+    plt.axhline(om, color='red', linestyle='--', label=f'Mean={om:.3f}')
+    plt.fill_between(x, om-osd, om+osd, color='red', alpha=0.15)
+    plt.xticks(x, [f"S{s}" for s in subjects])
+    plt.title("Subject-wise Accuracy (NeuroMel+EEGNet, 32×128, 10×10 CV, C3 8–30Hz)")
+    plt.ylabel("Accuracy"); plt.ylim(0, 1); plt.legend(); plt.tight_layout()
+    plt.savefig(f"{save_dir}/AllSubjects_Bar.png", dpi=300)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
