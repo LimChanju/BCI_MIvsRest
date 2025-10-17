@@ -14,7 +14,7 @@ DATA_DIR = "./dataset/"
 SAVE_DIR = "./Results_Mel"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-N_MELS, N_FFT, HOP = 32, 128, 64
+N_MELS, N_FFT, HOP = 16, 128, 32
 BATCH, EPOCHS, LR, SEED = 16, 50, 1e-3, 42
 torch.manual_seed(SEED); np.random.seed(SEED)
 
@@ -72,7 +72,7 @@ def load_bci2b_mel(path=DATA_DIR):
 # EEGNet
 # ------------------------------
 class EEGNet(nn.Module):
-    def __init__(self,chans,samples,n_classes=2,dropout=0.5,kernLength=64,F1=8,D=2,F2=16):
+    def __init__(self,chans,samples,n_classes=2,dropout=0.5,kernLength=16,F1=8,D=2,F2=16):
         super().__init__()
         self.conv1=nn.Conv2d(1,F1,(1,kernLength),padding=(0,kernLength//2),bias=False)
         self.bn1=nn.BatchNorm2d(F1)
@@ -198,5 +198,29 @@ def main_mel():
         results_mean.append(np.mean(accs)); results_std.append(np.std(accs))
         print(f" → Subject {subj}: {np.mean(accs):.3f} ± {np.std(accs):.3f}")
 
+            # =========================================
+    # ✅ 전체 결과 바그래프 (Mean ± SD 포함)
+    # =========================================
+    om, osd = np.mean(results_mean), np.std(results_mean)
+    np.savetxt(os.path.join(SAVE_DIR, "overall_summary.txt"), [om, osd], fmt="%.4f")
+
+    plt.figure(figsize=(9,6))
+    x = np.arange(len(subjects))
+    plt.bar(x, results_mean, yerr=results_std, capsize=5, color='steelblue', edgecolor='black', alpha=0.8)
+
+    # 평균선 + 범례에 Mean ± SD 표시
+    plt.axhline(om, color='red', linestyle='--', label=f'Mean = {om:.3f} ± {osd:.3f}')
+    plt.fill_between(x, om - osd, om + osd, color='red', alpha=0.15)
+
+    plt.xticks(x, [f"S{s}" for s in subjects])
+    plt.title("Mel spectrogram")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{SAVE_DIR}/AllSubjects_Bar.png", dpi=300)
+    plt.close()
+
 if __name__ == "__main__":
     main_mel()
+    
