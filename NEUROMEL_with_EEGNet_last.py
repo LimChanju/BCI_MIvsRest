@@ -27,7 +27,7 @@ DATA_DIR = "./dataset/"
 SAVE_DIR = "./Results_NeuroMel"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-N_MELS, N_FFT, HOP = 16, 128, 64
+N_MELS, N_FFT, HOP = 16, 128, 32
 BATCH, EPOCHS, LR, SEED = 16, 50, 1e-3, 42
 set_seed = lambda s=SEED: (np.random.seed(s), torch.manual_seed(s), torch.cuda.manual_seed_all(s))
 set_seed()
@@ -43,23 +43,31 @@ def butter_bandpass_filter(data, low, high, fs, order=4):
 # =========================
 # 2. NeuroMel Filterbank (Gaussian α/β)
 # =========================
-def neuro_mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
-    freqs = np.linspace(fmin, fmax, n_mels + 2)
-    alpha_center, beta_center = 10.5, 20.0
-    alpha_boost = np.exp(-((freqs - alpha_center) ** 2) / (2 * 3.5 ** 2))
-    beta_boost  = np.exp(-((freqs - beta_center) ** 2) / (2 * 6.5 ** 2))
-    weight = 0.6 * alpha_boost + 0.4 * beta_boost
-    freqs = fmin + (freqs - fmin) * (1 + 2.0 * weight)
+def neuro_mel_filterbank_adaptive(mel_full, freqs):
+    """
+    mel_full: Mel power spectrogram (n_mels x n_frames)
+    freqs: Mel filter center frequencies (len = n_mels + 2)
+    """
+    # 1️⃣ α, β 대역 인덱스 계산
+    mu_idx = np.where((freqs >= 8) & (freqs <= 13))[0]
+    beta_idx = np.where((freqs >= 14) & (freqs <= 30))[0]
 
-    freq_axis = np.linspace(0, sr / 2, n_fft // 2 + 1)
-    fb = np.zeros((n_mels, len(freq_axis)))
-    for m in range(1, n_mels + 1):
-        center = freqs[m]
-        left, right = freqs[m - 1], freqs[m + 1]
-        sigma = (right - left) / 2.5
-        fb[m - 1] = np.exp(-0.5 * ((freq_axis - center) / sigma) ** 2)
-    fb /= np.max(fb, axis=1, keepdims=True) + 1e-8
-    return fb
+    # 2️⃣ 각 피험자 trial별 α/β 파워 비율 계산
+    alpha_power = np.mean(mel_full[mu_idx, :])
+    beta_power = np.mean(mel_full[beta_idx, :])
+    ratio = alpha_power / (alpha_power + beta_power + 1e-8)  # α 비중 (0~1)
+
+    # 3️⃣ 피험자별 α/β 중심 가우시안 정의
+    freqs = np.linspace(8, 30, len(freqs))
+    alpha_center, beta_center = 10.5, 20.0
+    alpha_boost = np.exp(-((freqs - alpha_center)**2) / (2 * 3.5**2))
+    beta_boost  = np.exp(-((freqs - beta_center)**2) / (2 * 6.5**2))
+
+    # 4️⃣ Adaptive 가중 합
+    weight = ratio * alpha_boost + (1 - ratio) * beta_boost
+    weight /= np.max(weight)
+    return weight
+
 
 # =========================
 # 3. EEG → NeuroMel 변환
@@ -67,11 +75,24 @@ def neuro_mel_filterbank(sr, n_fft, n_mels, fmin, fmax):
 def eeg_to_neuromel(eeg_signal, fs, band):
     low, high = band
     filtered = butter_bandpass_filter(eeg_signal, low, high, fs)
+
+    # 1️⃣ STFT
     S = np.abs(librosa.stft(y=filtered, n_fft=N_FFT, hop_length=HOP, window='hann')) ** 2
-    mel_fb = neuro_mel_filterbank(int(fs), N_FFT, N_MELS, low, high)
-    mel_spec = np.dot(mel_fb, S)
-    mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+
+    # 2️⃣ Mel 변환 (기본 Mel filterbank)
+    mel_fb = librosa.filters.mel(sr=fs, n_fft=N_FFT, n_mels=N_MELS, fmin=8, fmax=30)
+    mel_full = np.dot(mel_fb, S)  # (n_mels, n_frames)
+    freq_bins = librosa.mel_frequencies(n_mels=N_MELS, fmin=8, fmax=30)
+
+    # 3️⃣ Adaptive NeuroMel 필터 적용
+    weight = neuro_mel_filterbank_adaptive(mel_full, freq_bins)
+    mel_weighted = mel_full * weight[:, None]
+
+    # 4️⃣ 로그 스케일 + 정규화
+    mel_db = librosa.power_to_db(mel_weighted, ref=np.max)
     mel_db = (mel_db - np.mean(mel_db)) / (np.std(mel_db) + 1e-6)
+
+    # 5️⃣ 이미지 형태로 리사이즈
     img = cv2.resize(mel_db, (128, 32), interpolation=cv2.INTER_CUBIC)
     return img.astype(np.float32)
 
@@ -144,7 +165,7 @@ def make_neuromel_dataset(X_raw, y_raw, fs, subj_dir=None):
 # 6. EEGNet backbone
 # =========================
 class EEGNet(nn.Module):
-    def __init__(self, chans, samples, n_classes=2, dropout=0.5, kernLength=64, F1=8, D=2, F2=16):
+    def __init__(self, chans, samples, n_classes=2, dropout=0.5, kernLength=16, F1=8, D=2, F2=16):
         super().__init__()
         self.conv1 = nn.Conv2d(1, F1, (1, kernLength), padding=(0, kernLength//2), bias=False)
         self.bn1 = nn.BatchNorm2d(F1)
@@ -250,11 +271,17 @@ def main():
     plt.figure(figsize=(9,6))
     x = np.arange(len(subjects))
     plt.bar(x, results_mean, yerr=results_std, capsize=5, color='steelblue', edgecolor='black', alpha=0.8)
-    plt.axhline(om, color='red', linestyle='--', label=f'Mean={om:.3f}')
-    plt.fill_between(x, om-osd, om+osd, color='red', alpha=0.15)
+
+    # 평균선 + 범례에 Mean ± SD 표시
+    plt.axhline(om, color='red', linestyle='--', label=f'Mean = {om:.3f} ± {osd:.3f}')
+    plt.fill_between(x, om - osd, om + osd, color='red', alpha=0.15)
+
     plt.xticks(x, [f"S{s}" for s in subjects])
-    plt.title("Subject-wise Accuracy (NeuroMel+EEGNet, 32×128, 10×10 CV, C3 8–30Hz)")
-    plt.ylabel("Accuracy"); plt.ylim(0, 1); plt.legend(); plt.tight_layout()
+    plt.title("Ours")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1)
+    plt.legend()
+    plt.tight_layout()
     plt.savefig(f"{SAVE_DIR}/AllSubjects_Bar.png", dpi=300)
     plt.close()
     print(f"\n=== 전체 평균 정확도: {om:.3f} ± {osd:.3f} ===")
